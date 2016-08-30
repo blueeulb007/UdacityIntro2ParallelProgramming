@@ -5,3 +5,5 @@ There are other files together in order to compile. Also, the compilation requir
 To compile and run, go to https://classroom.udacity.com/courses/cs344.
 
 The whole course materials can be found at https://github.com/udacity/cs344
+
+The CUDA Documentation can be found at http://docs.nvidia.com/cuda/index.html#axzz4IqhAzEQP

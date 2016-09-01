@@ -82,22 +82,22 @@
 
 #include "reference_calc.cpp"
 #include "utils.h"
+#include <math.h>
 
 
 // function for calculating the min; use shared memory and reduce primitive 
-__global__ void minmax_shmem_reduce_kernal(float *d_out, const float* d_in, const size_t numRows, const size_t numCols, bool min)
+__global__ void minmax_shmem_reduce_kernal(float *d_out, const float* d_in, const int NUMTOLPIXEL, bool min)
 {  
   // the indexes; the "global" location in the whole image
-  const int2 pixel_2D_global = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
-  const int  pixel_1D_global = pixel_2D_global.y * numCols + pixel_2D_global.x;
+  const int  pixel_1D_global = blockIdx.x * blockDim.x + threadIdx.x;
 
   // make sure the pixel being processed is indeed within the image
-  if (pixel_2D_global.x >= numCols || pixel_2D_global.y >= numRows){
+  if (pixel_1D_global >= NUMTOLPIXEL){
     return;
   }
 
   // the indexes; the location within the block, i.e, their thread indexes; used to index the sh_image
-  const int pixel_1D_block = threadIdx.y * blockDim.x + threadIdx.x;
+  const int pixel_1D_block = threadIdx.x;
 
   // The Shared memory is to store the image block
   extern __shared__ float sh_image[];
@@ -105,53 +105,87 @@ __global__ void minmax_shmem_reduce_kernal(float *d_out, const float* d_in, cons
   __syncthreads(); // make sure entire block is loaded
 
   // do reduction in shared mem
-  for (int s = blockDim.x * blockDim.y / 2 ; s > 0; s >>= 1){
+  for (int s = blockDim.x / 2 ; s > 0; s >>= 1){
     if (pixel_1D_block < s){
       if(min){
-        if(sh_image[pixel_1D_block + s] < sh_image[pixel_1D_block]){
-            sh_image[pixel_1D_block] = sh_image[pixel_1D_block + s];
-        }
+		sh_image[pixel_1D_block] = min(sh_image[pixel_1D_block], sh_image[pixel_1D_block + s];
       }
       else
       {
-        if (sh_image[pixel_1D_block + s] > sh_image[pixel_1D_block]){
-            sh_image[pixel_1D_block] =  sh_image[pixel_1D_block + s];
-        }
+		sh_image[pixel_1D_block] = max(sh_image[pixel_1D_block], sh_image[pixel_1D_block + s];
       }
     }
-
     __syncthreads(); // make sure all operations at one stage are done
   }
 
   // only thread 0 writes the result for this block back to globel mem
   if (pixel_1D_block == 0){
-    d_out[ blockIdx.y * gridDim.x  + blockIdx.x] = sh_image[0];
+    d_out[blockIdx.x] = sh_image[0];
   }
 
 }
 
 
 // function to calculating calculate the hist gram
-__global__ void histo(int * d_bins, const float* d_in, const size_t numRows, const size_t numCols, const size_t numBins, const float *min_logLum, const float *lumRange)
+__global__ void histo(int * d_bins, const float* d_in, const size_t NUMTOLPIXEL, const size_t numBins, const float min_logLum, const float lumRange)
 {
 
   // the indexes; the "global" location in the whole image
-  const int2 pixel_2D_global = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
-  const int  pixel_1D_global = pixel_2D_global.y * numCols + pixel_2D_global.x;
+  const int  pixel_1D_global = blockIdx.x * blockDim.x + threadIdx.x;
 
   // make sure the pixel being processed is indeed within the image
-  if (pixel_2D_global.x >= numCols || pixel_2D_global.y >= numRows){
+  if (pixel_1D_global >= NUMTOLPIXEL){
     return;
   }
 
   float lum = d_in[pixel_1D_global];
-  int   bin = (lum - *min_logLum ) / *lumRange * numBins;
+  int   bin = (lum - min_logLum ) / lumRange * numBins;
   atomicAdd(&(d_bins[bin]), 1);
 }
 
+// function to calculate min or max using reduce
+
+
 
 // function to do the exclusive scan
+float reduce_minmax(const float* const d_logLuminance, const size_t NUMTOLPIXEL, bool minFlag)
+{
 
+	const int BLOCKSIZE =   32;
+  
+	int gridSize = ceil(NUMTOPIXEL / BLOCKSIZE);
+  
+	// declare intermediate GPU memory pointers
+	float *d_out, *d_in;
+
+	// allocate memory for them
+	checkCudaErrors(cudaMalloc( (void **) &d_in, sizeof(float) * size));    
+	checkCudaErrors(cudaMemcpy(d_in, d_logLuminance, sizeof(float) * size, cudaMemcpyDeviceToDevice));
+  
+	checkCudaErrors( cudaMalloc( (void **) &d_out,  sizeof(float) * gridSize ) );
+
+	
+	minmax_shmem_reduce_kernal<<<gridSize, BLOCKSIZE, sizeof(float) * BLOCKSIZE >>> (d_out, d_logLuminance, NUMTOLPIXEL, minFlag);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+  
+	// Keep calling the kernal until the gridSize reaches 1
+	while(gridSize > 1 ){
+		// first update input to be the output from pervious kernel call
+		checkCudaErros(cudaFree( d_in) );
+		d_in = d_out;
+
+		// update the gridSize
+		gridSize = ceil( gridSize / BLOCKSIZE);
+
+		// Call the kernal again
+		minmax_shmem_reduce_kernal<<<gridSize, BLOCKSIZE, sizeof(float) * BLOCKSIZE >>> (d_out, d_in, NUMTOLPIXEL, minFlag);
+		cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+	}
+
+	float result = d_out[0];
+	checkCudaErrors(CudaFree(d_out));
+	return result;
+}
   
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
@@ -172,56 +206,33 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
 
-  // 1)
-  int blockSizeX = 32;
-  int blockSizeY = 32;
-  const int MAXTHREADPERBLOCK = 1024;
+  // ZL: Use 1D block and thread to simply the indexing through out the whole file
+	const size_t NUMTOLPIXEL  = numRows * numCols;
+	const int MAXTHREADPERBLOCK = 1024;	
 
-  const dim3 blockSize(blockSizeX, blockSizeY, 1);
+  // 1) *********************************************  1)
+	min_logLum = reduce_minmax(d_logLuminance, NUMTOLPIXEL,true);
+	max_logLum = reduce_minmax(d_logLuminance, NUMTOLPIXEL,false);
 
-  unsigned int gridX = ( numCols % blockSize.x) == 0 ? ( numCols / blockSize.x ) : ( numCols / blockSize.x  + 1);
-  unsigned int gridY = ( numRows % blockSize.y) == 0 ? ( numRows / blockSize.y ) : ( numRows / blockSize.y  + 1);
-  const dim3 gridSize( gridX, gridY, 1); 
+  // ************************************************  2)
+	const float lumRange = max_logLum - min_logLum;
 
-  // declare intermediate GPU memory pointers
-  float *d_intermediate, *d_out;
-
-  // allocate memory for them
-  checkCudaErrors( cudaMalloc( (void **) &d_intermediate,  sizeof(float) *gridX * gridY ) );
-  checkCudaErrors( cudaMalloc( (void **) &d_out,  sizeof(float)));
-
-  // min calculation
-  minmax_shmem_reduce_kernal<<<gridSize, blockSize, sizeof(float) * blockSizeX * blockSizeY >>> (d_intermediate, d_logLuminance, numRows, numCols, true);
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-  //minmax_shmem_reduce_kernal<<<1, gridX * gridY,  sizeof(float) * gridX * gridY>>> (d_out, d_intermediate, gridY, gridX, true);
- 
-  min_logLum = *d_out;
-
-  //max calculation
-  minmax_shmem_reduce_kernal<<<gridSize, blockSize, sizeof(float) * blockSizeX * blockSizeY >>> (d_intermediate, d_logLuminance, numRows, numCols, false);
-
-  //minmax_shmem_reduce_kernal<<<1, gridX * gridY,  sizeof(float) * gridX * gridY>>> (d_out, d_intermediate, gridY, gridX, false); 
-
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-  max_logLum = *d_out;
-
-  // 2)
-  const float lumRange = max_logLum - min_logLum;
-
-  // 3)
+  // ************************************************  3)
   // declare GPU memory
-  int* d_bins;
-
+	int* d_bins;
+  
   //allocate memory for it;
-  checkCudaErrors( cudaMalloc( (void **) & d_bins, sizeof(int) * numBins ));
+	checkCudaErrors( cudaMalloc( (void **) & d_bins, sizeof(int) * numBins ));
   
   // initialize to 0 
-  for(int i = 0 ; i < numBins; ++i){
-    d_bins[i] = 0;
-  }
+    checkCudaErrors(cudaMemset(d_bins, 0, sizeof(int) * numBins));  
 
-  histo<<<gridSize, blockSize>>>(d_bins, d_logLuminance, numRows, numCols, numBins, &min_logLum, &lumRange);
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+  // Call histo kernel
+	const int blockSize =  MAXTHREADPERBLOCK;
+	int gridSize  = ceil(NUMTOLPIXEL / MAXTHREADPERBLOCK);
+	histo<<<gridSize, blockSize>>>(d_bins, d_logLuminance, numRows, numCols, numBins, &min_logLum, &lumRange);
+	
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
   
   // 4)
   int acc = 0;
@@ -231,8 +242,6 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
   }
 
   // Free memory
-  checkCudaErrors(cudaFree(d_intermediate));
-  checkCudaErrors(cudaFree(d_out));
   checkCudaErrors(cudaFree(d_bins));
 
 }

@@ -180,10 +180,11 @@ __global__ void scancdf_kernel(int *d_bins, int size)
 float reduce_minmax(const float* const d_logLuminance, const size_t NUMTOLPIXEL, bool minFlag)
 {
 
-	const int BLOCKSIZE =   32;
+	const int BLOCKSIZE =   1024;
   
 	size_t curr_size = NUMTOLPIXEL;
-  
+    printf("Curr_size = %d\n", curr_size);
+
 	// declare intermediate GPU memory pointers
 	float *d_out, *d_in;
 
@@ -194,9 +195,10 @@ float reduce_minmax(const float* const d_logLuminance, const size_t NUMTOLPIXEL,
 	dim3 thread_dim(BLOCKSIZE);
 
 
-	while(1){
+	while(curr_size > 1 ){
 		checkCudaErrors( cudaMalloc( (void **) &d_out,  sizeof(float) * get_max_size(curr_size, BLOCKSIZE) ) );
 
+		
 		dim3 block_dim(get_max_size(curr_size, BLOCKSIZE));
 
 		minmax_shmem_reduce_kernal<<<block_dim, thread_dim, sizeof(float) * BLOCKSIZE >>> (d_out, d_in, curr_size, minFlag);
@@ -205,19 +207,21 @@ float reduce_minmax(const float* const d_logLuminance, const size_t NUMTOLPIXEL,
 		checkCudaErrors(cudaFree( d_in) );
 		d_in = d_out;
 
+		curr_size = get_max_size(curr_size, BLOCKSIZE);
+
 		printf("Curr_size = %d\n", curr_size);
 
-		if(curr_size < BLOCKSIZE){
-			break;
-		}
-		
-		curr_size = get_max_size(curr_size, BLOCKSIZE);
 	}
 
 	float h_out;
     cudaMemcpy(&h_out, d_out, sizeof(float), cudaMemcpyDeviceToHost);
+	
     cudaFree(d_out);
+	
+	printf("%f\n", h_out);
+	
     return h_out;
+	
 }
 
 
